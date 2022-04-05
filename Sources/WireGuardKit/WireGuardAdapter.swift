@@ -2,7 +2,6 @@
 // Copyright © 2018-2021 WireGuard LLC. All Rights Reserved.
 
 import Foundation
-import NetworkExtension
 
 #if SWIFT_PACKAGE
 import WireGuardKitGo
@@ -42,10 +41,8 @@ public class WireGuardAdapter {
     public typealias LogHandler = (WireGuardLogLevel, String) -> Void
 
     /// Network routes monitor.
-    private var networkMonitor: NWPathMonitor?
 
     /// Packet tunnel provider.
-    private weak var packetTunnelProvider: NEPacketTunnelProvider?
 
     /// Log handler closure.
     private let logHandler: LogHandler
@@ -129,8 +126,7 @@ public class WireGuardAdapter {
     /// - Parameter packetTunnelProvider: an instance of `NEPacketTunnelProvider`. Internally stored
     ///   as a weak reference.
     /// - Parameter logHandler: a log handler closure.
-    public init(with packetTunnelProvider: NEPacketTunnelProvider, logHandler: @escaping LogHandler) {
-        self.packetTunnelProvider = packetTunnelProvider
+    public init(logHandler: @escaping LogHandler) {
         self.logHandler = logHandler
 
         setupLogHandler()
@@ -142,7 +138,6 @@ public class WireGuardAdapter {
         wgSetLogger(nil, nil)
 
         // Cancel network monitor
-        networkMonitor?.cancel()
 
         // Shutdown the tunnel
         if case .started(let handle, _) = self.state {
@@ -181,16 +176,8 @@ public class WireGuardAdapter {
                 return
             }
 
-            let networkMonitor = NWPathMonitor()
-            networkMonitor.pathUpdateHandler = { [weak self] path in
-                self?.didReceivePathUpdate(path: path)
-            }
-            networkMonitor.start(queue: self.workQueue)
-
             do {
                 let settingsGenerator = try self.makeSettingsGenerator(with: tunnelConfiguration)
-                try self.setNetworkSettings(settingsGenerator.generateNetworkSettings())
-
                 let (wgConfig, resolutionResults) = settingsGenerator.uapiConfiguration()
                 self.logEndpointResolutionResults(resolutionResults)
 
@@ -198,10 +185,7 @@ public class WireGuardAdapter {
                     try self.startWireGuardBackend(wgConfig: wgConfig),
                     settingsGenerator
                 )
-                self.networkMonitor = networkMonitor
-                completionHandler(nil)
             } catch let error as WireGuardAdapterError {
-                networkMonitor.cancel()
                 completionHandler(error)
             } catch {
                 fatalError()
@@ -225,9 +209,6 @@ public class WireGuardAdapter {
                 return
             }
 
-            self.networkMonitor?.cancel()
-            self.networkMonitor = nil
-
             self.state = .stopped
 
             completionHandler(nil)
@@ -248,14 +229,9 @@ public class WireGuardAdapter {
             // Tell the system that the tunnel is going to reconnect using new WireGuard
             // configuration.
             // This will broadcast the `NEVPNStatusDidChange` notification to the GUI process.
-            self.packetTunnelProvider?.reasserting = true
-            defer {
-                self.packetTunnelProvider?.reasserting = false
-            }
 
             do {
                 let settingsGenerator = try self.makeSettingsGenerator(with: tunnelConfiguration)
-                try self.setNetworkSettings(settingsGenerator.generateNetworkSettings())
 
                 switch self.state {
                 case .started(let handle, _):
@@ -263,9 +239,6 @@ public class WireGuardAdapter {
                     self.logEndpointResolutionResults(resolutionResults)
 
                     wgSetConfig(handle, wgConfig)
-                    #if os(iOS)
-                    wgDisableSomeRoamingForBrokenMobileSemantics(handle)
-                    #endif
 
                     self.state = .started(handle, settingsGenerator)
 
@@ -300,40 +273,6 @@ public class WireGuardAdapter {
             let tunnelLogLevel = WireGuardLogLevel(rawValue: logLevel) ?? .verbose
 
             unretainedSelf.logHandler(tunnelLogLevel, swiftString)
-        }
-    }
-
-    /// Set network tunnel configuration.
-    /// This method ensures that the call to `setTunnelNetworkSettings` does not time out, as in
-    /// certain scenarios the completion handler given to it may not be invoked by the system.
-    ///
-    /// - Parameters:
-    ///   - networkSettings: an instance of type `NEPacketTunnelNetworkSettings`.
-    /// - Throws: an error of type `WireGuardAdapterError`.
-    /// - Returns: `PacketTunnelSettingsGenerator`.
-    private func setNetworkSettings(_ networkSettings: NEPacketTunnelNetworkSettings) throws {
-        var systemError: Error?
-        let condition = NSCondition()
-
-        // Activate the condition
-        condition.lock()
-        defer { condition.unlock() }
-
-        self.packetTunnelProvider?.setTunnelNetworkSettings(networkSettings) { error in
-            systemError = error
-            condition.signal()
-        }
-
-        // Packet tunnel's `setTunnelNetworkSettings` times out in certain
-        // scenarios & never calls the given callback.
-        let setTunnelNetworkSettingsTimeout: TimeInterval = 5 // seconds
-
-        if condition.wait(until: Date().addingTimeInterval(setTunnelNetworkSettingsTimeout)) {
-            if let systemError = systemError {
-                throw WireGuardAdapterError.setNetworkSettings(systemError)
-            }
-        } else {
-            self.logHandler(.error, "setTunnelNetworkSettings timed out after 5 seconds; proceeding anyway")
         }
     }
 
@@ -377,9 +316,6 @@ public class WireGuardAdapter {
         if handle < 0 {
             throw WireGuardAdapterError.startWireGuardBackend(handle)
         }
-        #if os(iOS)
-        wgDisableSomeRoamingForBrokenMobileSemantics(handle)
-        #endif
         return handle
     }
 
@@ -411,59 +347,6 @@ public class WireGuardAdapter {
         }
     }
 
-    /// Helper method used by network path monitor.
-    /// - Parameter path: new network path
-    private func didReceivePathUpdate(path: Network.NWPath) {
-        self.logHandler(.verbose, "Network change detected with \(path.status) route and interface order \(path.availableInterfaces)")
-
-        #if os(macOS)
-        if case .started(let handle, _) = self.state {
-            wgBumpSockets(handle)
-        }
-        #elseif os(iOS)
-        switch self.state {
-        case .started(let handle, let settingsGenerator):
-            if path.status.isSatisfiable {
-                let (wgConfig, resolutionResults) = settingsGenerator.endpointUapiConfiguration()
-                self.logEndpointResolutionResults(resolutionResults)
-
-                wgSetConfig(handle, wgConfig)
-                wgDisableSomeRoamingForBrokenMobileSemantics(handle)
-                wgBumpSockets(handle)
-            } else {
-                self.logHandler(.verbose, "Connectivity offline, pausing backend.")
-
-                self.state = .temporaryShutdown(settingsGenerator)
-                wgTurnOff(handle)
-            }
-
-        case .temporaryShutdown(let settingsGenerator):
-            guard path.status.isSatisfiable else { return }
-
-            self.logHandler(.verbose, "Connectivity online, resuming backend.")
-
-            do {
-                try self.setNetworkSettings(settingsGenerator.generateNetworkSettings())
-
-                let (wgConfig, resolutionResults) = settingsGenerator.uapiConfiguration()
-                self.logEndpointResolutionResults(resolutionResults)
-
-                self.state = .started(
-                    try self.startWireGuardBackend(wgConfig: wgConfig),
-                    settingsGenerator
-                )
-            } catch {
-                self.logHandler(.error, "Failed to restart backend: \(error.localizedDescription)")
-            }
-
-        case .stopped:
-            // no-op
-            break
-        }
-        #else
-        #error("Unsupported")
-        #endif
-    }
 }
 
 /// A enum describing WireGuard log levels defined in `api-apple.go`.
@@ -472,16 +355,3 @@ public enum WireGuardLogLevel: Int32 {
     case error = 1
 }
 
-private extension Network.NWPath.Status {
-    /// Returns `true` if the path is potentially satisfiable.
-    var isSatisfiable: Bool {
-        switch self {
-        case .requiresConnection, .satisfied:
-            return true
-        case .unsatisfied:
-            return false
-        @unknown default:
-            return true
-        }
-    }
-}
